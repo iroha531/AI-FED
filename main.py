@@ -7,6 +7,14 @@
   python main.py --models resnet18 efficientnet_b0 # モデルを指定
   python main.py --limit 600 --epochs 2            # 動作確認 (画像を間引くので提出用には使わない)
 
+改善オプション (CNNモデル向け。結果は efficientnet_b0_ctx のように別名で保存されるので、既存の結果は消えない):
+  --context       自分のタイル + 周囲8タイルの縁 (--margin px) を貼り合わせた画像を入力にする
+                  (縁の欠片の「本体」が隣にある見落とし / 穴ではない大きな物体の誤検出 への対策)
+                  ※ファイル名の連番 (18列x14行) から隣を読むので、コンペのルールを確認してから使うこと
+  --strong_aug    明るさ・コントラスト・ガンマの変動を強める (白っぽい写真や薄い跡への対策)
+  --clahe         局所コントラスト補正 (要: pip install opencv-python-headless)
+  例: python main.py --models efficientnet_b0 resnet18 --context --strong_aug
+
 評価指標はコンペと同じ F1 スコア。
 各モデルの F1 は「撮影元の写真単位のCV (OOF予測)」で、F1最大のしきい値を使って算出する。
 
@@ -32,12 +40,18 @@ from sklearn.ensemble import ExtraTreesClassifier, HistGradientBoostingClassifie
 from sklearn.metrics import average_precision_score, f1_score
 from sklearn.model_selection import StratifiedGroupKFold
 
+try:  # --clahe を使うときだけ必要
+    import cv2
+except ImportError:
+    cv2 = None
+
 try:  # PyTorch が無くても hgb / extratrees だけなら動く
     import torch
     import torch.nn as nn
     import torchvision
     from torch.utils.data import DataLoader, Dataset
     from torchvision import transforms as T
+    import torchvision.transforms.functional as TF
 except ImportError:
     torch = None
 
@@ -133,20 +147,98 @@ def run_sklearn(name, X, y, Xte, splits, seed):
     return oof, te
 
 
+# ----------------------------------------------------------------- 周囲タイルの合成 / CLAHE (--context, --clahe)
+COLS, TILE = 18, 256  # 1枚の写真は 18列 x 14行 = 252タイル (各256x256)。連番は 左→右、上→下
+
+
+def tile_pos(path):
+    """W/UW/7071-82.jpg -> (7071, 82)   (7107-28_2.jpg も (7107, 28))"""
+    m = re.search(r"/(\d+)-(\d+)", path)
+    return int(m.group(1)), int(m.group(2))
+
+
+def build_lookup(*path_lists):
+    """(写真番号, タイル番号) -> 画像パス。7107-28_2.jpg のように _2 付きの名前になっているタイルもある
+    (その番号の通常ファイルが無い場合が多い)。両方あれば通常ファイルを優先する"""
+    lut = {}
+    for paths in path_lists:
+        for p in paths:
+            key = tile_pos(p)
+            if key not in lut or ("_" in Path(lut[key]).stem and "_" not in Path(p).stem):
+                lut[key] = p
+    return lut
+
+
+def compose_crop(root, path, lut, margin):
+    """自分のタイルを中央に置き、周囲8タイルを縁から margin px 分だけ貼り合わせた (256+2*margin) 四方の画像。
+    写真の端などで隣が無い部分は灰色。中央のタイルは縮小せず原寸のまま。"""
+    root = Path(root)
+    g, i = tile_pos(path)
+    r, c = divmod(i - 1, COLS)
+    side = TILE + 2 * margin
+    canvas = Image.new("RGB", (side, side), (128, 128, 128))
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            rr, cc = r + dr, c + dc
+            if dr == 0 and dc == 0:
+                p = path
+            elif 0 <= cc < COLS and rr >= 0 and (g, rr * COLS + cc + 1) in lut:
+                p = lut[(g, rr * COLS + cc + 1)]
+            else:
+                continue
+            tile = Image.open(root / p).convert("RGB")
+            if tile.size != (TILE, TILE):
+                tile = tile.resize((TILE, TILE))
+            canvas.paste(tile, (margin + dc * TILE, margin + dr * TILE))  # はみ出す分は自動で切り捨て
+    return canvas
+
+
+def apply_clahe(img):
+    """明るさ(L)チャンネルだけに CLAHE をかける"""
+    cv2.setNumThreads(0)
+    lab = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2LAB)
+    lab[..., 0] = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(lab[..., 0])
+    return Image.fromarray(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB))
+
+
 # ----------------------------------------------------------------- CNN (PyTorch)
 if torch is not None:
 
     class PconDataset(Dataset):
+        def __init__(self, root, paths, labels=None, train=False, cfg=None):
+            cfg = cfg or {}
             self.root, self.paths, self.labels, self.train = Path(root), list(paths), labels, train
+            self.ctx, self.margin, self.lut = cfg.get("context", False), cfg.get("margin", 64), cfg.get("lut")
+            self.clahe, self.strong = cfg.get("clahe", False), cfg.get("strong_aug", False)
+            size = cfg.get("size", 256)
+            # 画像の端に一部だけ写るPコンも「あり」なので、切り抜き系の拡張は使わない。
+            # context のときは周囲込みの画像を縮小せず原寸で使う
+            resize = [] if self.ctx else [T.Resize((size, size))]
+            self.tf = T.Compose(resize + [T.ToTensor(), T.Normalize(MEAN, STD)])
+            self.color = (T.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.2, hue=0.02) if self.strong
+                          else T.ColorJitter(brightness=0.25, contrast=0.25, saturation=0.1))
+            if self.ctx:  # 4つ目のチャンネル: 「判定対象のタイル」の範囲を 1、周囲を 0 で示す
+                side = TILE + 2 * self.margin
+                self.mask = torch.zeros(1, side, side)
+                self.mask[:, self.margin:self.margin + TILE, self.margin:self.margin + TILE] = 1
 
         def __len__(self):
             return len(self.paths)
 
         def __getitem__(self, i):
+            if self.ctx:
+                img = compose_crop(self.root, self.paths[i], self.lut, self.margin)
+            else:
                 img = Image.open(self.root / self.paths[i]).convert("RGB")
+            if self.clahe:
+                img = apply_clahe(img)
             if self.train:
                 img = self.color(img)
+                if self.strong and random.random() < 0.5:
+                    img = TF.adjust_gamma(img, random.uniform(0.7, 1.4))
             x = self.tf(img)
+            if self.ctx:
+                x = torch.cat([x, self.mask], 0)
             if self.train:
                 if random.random() < 0.5:
                     x = torch.flip(x, [2])
@@ -155,6 +247,28 @@ if torch is not None:
                 x = torch.rot90(x, random.randint(0, 3), (1, 2))
             return x if self.labels is None else (x, torch.tensor(float(self.labels[i])))
 
+    def add_mask_channel(model):
+        """最初の畳み込みを 3ch → 4ch にする (学習済みの重みはRGB分を引き継ぎ、4ch目は0で初期化)"""
+        for name, conv in model.named_modules():
+            if isinstance(conv, nn.Conv2d):
+                break
+        *path, last = name.split(".")
+        parent = model
+        for q in path:
+            parent = parent[int(q)] if q.isdigit() else getattr(parent, q)
+        new = nn.Conv2d(4, conv.out_channels, conv.kernel_size, conv.stride, conv.padding,
+                        bias=conv.bias is not None)
+        with torch.no_grad():
+            new.weight.zero_()
+            new.weight[:, :3] = conv.weight
+            if conv.bias is not None:
+                new.bias.copy_(conv.bias)
+        if last.isdigit():
+            parent[int(last)] = new
+        else:
+            setattr(parent, last, new)
+
+    def build_model(name, context=False):
         tv = torchvision.models
         if name == "resnet18":
             m = tv.resnet18(weights=tv.ResNet18_Weights.DEFAULT)
@@ -173,6 +287,8 @@ if torch is not None:
             m.classifier[2] = nn.Linear(m.classifier[2].in_features, 1)
         else:
             raise ValueError(name)
+        if context:
+            add_mask_channel(m)
         return m
 
     @torch.no_grad()
@@ -186,16 +302,22 @@ if torch is not None:
             outs.append(torch.stack([torch.sigmoid(model(v).squeeze(1)) for v in views]).mean(0).float().cpu())
         return torch.cat(outs).numpy()
 
+    def run_cnn(name, tag, cfg, args, paths, y, test_paths, splits, device, out_dir):
+        d = Path(out_dir) / tag
         d.mkdir(parents=True, exist_ok=True)
+        dl_te = DataLoader(PconDataset(args.data_root, test_paths, None, cfg=cfg),
                            batch_size=args.batch_size * 2, shuffle=False, num_workers=args.workers,
                            pin_memory=device.type == "cuda")
         oof, te = np.zeros(len(y)), np.zeros(len(test_paths))
         use_amp = device.type == "cuda"
         for k, (tr, va) in enumerate(splits):
+            dl_tr = DataLoader(PconDataset(args.data_root, paths[tr], y[tr], train=True, cfg=cfg),
                                batch_size=args.batch_size, shuffle=True, num_workers=args.workers,
                                drop_last=True, pin_memory=use_amp)
+            dl_va = DataLoader(PconDataset(args.data_root, paths[va], y[va], cfg=cfg),
                                batch_size=args.batch_size * 2, shuffle=False, num_workers=args.workers,
                                pin_memory=use_amp)
+            model = build_model(name, cfg["context"]).to(device)
             pos, neg = y[tr].sum(), (1 - y[tr]).sum()
             pw = torch.tensor([min(float(np.sqrt(neg / max(pos, 1))), 10.0)], device=device)
             crit = nn.BCEWithLogitsLoss(pos_weight=pw)
@@ -218,6 +340,7 @@ if torch is not None:
                 sched.step()
                 p = predict(model, dl_va, device, tta=False)
                 ap = average_precision_score(y[va], p) if y[va].sum() > 0 else 0.0
+                print(f"  [{tag}] fold {k + 1}/{len(splits)} epoch {ep + 1}/{args.epochs} "
                       f"loss {total / max(len(tr), 1):.4f} val AP {ap:.4f}", flush=True)
                 if ap > best_ap:  # 検証APが最良のエポックを採用
                     best_ap = ap
@@ -258,12 +381,21 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="動作確認用: 画像をこの枚数に間引く")
     ap.add_argument("--rerun", action="store_true", help="結果が既にあるモデルも再実行する")
     ap.add_argument("--no_ensemble", action="store_true", help="上位3モデルの平均 (ensemble) を作らない")
+    ap.add_argument("--context", action="store_true", help="周囲8タイルを貼り合わせた画像を入力にする")
+    ap.add_argument("--margin", type=int, default=64, help="--context で隣のタイルから取り込む幅 (px)")
+    ap.add_argument("--strong_aug", action="store_true", help="明るさ・コントラスト・ガンマの拡張を強める")
+    ap.add_argument("--clahe", action="store_true", help="CLAHE (局所コントラスト補正) を前処理に入れる")
+    ap.add_argument("--only_this_run", action="store_true",
+                    help="比較・ensembleを今回実行したモデルだけにする (既定: result/ 内の全モデルを対象)")
     args = ap.parse_args()
 
     seed_everything(args.seed)
     root = Path(args.data_root)
+    if args.clahe and cv2 is None:
+        raise SystemExit("--clahe には OpenCV が必要です: pip install opencv-python-headless")
     df = pd.read_csv(root / "train_label.csv", header=None, names=["path", "label"])
     test_paths = [l.strip() for l in open(root / "test.txt", encoding="utf-8") if l.strip()]
+    lut = build_lookup(df["path"], test_paths)  # --limit で間引く前の全画像から、隣のタイルを探せるようにする
     if args.limit:
         df = df.sample(n=min(args.limit, len(df)), random_state=args.seed).reset_index(drop=True)
         test_paths = list(pd.Series(test_paths).sample(n=min(args.limit, len(test_paths)), random_state=args.seed))
@@ -281,13 +413,21 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device if device is not None else "PyTorchなし (CNNモデルはスキップ)")
 
+    # CNNの結果は、オプションに応じた名前 (例: efficientnet_b0_ctx_aug) で別に保存する
+    suffix = ("_ctx" if args.context else "") + ("_aug" if args.strong_aug else "") + ("_clahe" if args.clahe else "")
+    cfg = {"size": args.size, "context": args.context, "margin": args.margin, "lut": lut,
+           "strong_aug": args.strong_aug, "clahe": args.clahe}
+
     results, feats = {}, None
+    for model_name in args.models:
+        name = model_name + suffix if model_name in CNN_MODELS else model_name
         if not args.rerun and (r := load_result(args.result_dir, name)) is not None and len(r[1]) == len(y):
             print(f"\n--- {name}: 既存の結果を読み込み (再実行は --rerun) ---")
             results[name] = r
             continue
         print(f"\n--- {name}: 学習開始 ---")
         t0 = time.time()
+        if model_name in SK_MODELS:
             if feats is None:
                 print("  画像の特徴量を計算中...", flush=True)
                 feats = (np.stack([image_features(root, p) for p in paths]),
@@ -297,6 +437,7 @@ def main():
             if torch is None:
                 print(f"  [スキップ] {name} には PyTorch が必要です: pip install torch torchvision")
                 continue
+            oof, te = run_cnn(model_name, name, cfg, args, paths, y, test_paths, splits, device, args.result_dir)
         m = save_result(args.result_dir, name, paths, y, oof, test_paths, te,
                         summarize(y, oof, splits, time.time() - t0))
         results[name] = (m, oof, te)
@@ -304,6 +445,19 @@ def main():
 
     if not results:
         raise SystemExit("実行できたモデルがありません。")
+
+    # result/ にある他の結果 (以前の実行分) も比較・ensembleの対象に加える
+    if not args.only_this_run and Path(args.result_dir).exists():
+        extra = []
+        for d in sorted(Path(args.result_dir).iterdir()):
+            if d.name in results or d.name in ("ensemble", "stack") or not d.is_dir():
+                continue
+            r = load_result(args.result_dir, d.name)
+            if r is not None and len(r[1]) == len(y) and len(r[2]) == len(test_paths):
+                results[d.name] = r
+                extra.append(d.name)
+        if extra:
+            print(f"\n[比較・ensembleの対象に既存の結果も追加] {', '.join(extra)}")
 
     # 上位3モデルの確率を平均 (アンサンブル)
     if not args.no_ensemble and len(results) >= 2:
