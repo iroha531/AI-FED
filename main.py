@@ -137,17 +137,13 @@ def run_sklearn(name, X, y, Xte, splits, seed):
 if torch is not None:
 
     class PconDataset(Dataset):
-        def __init__(self, root, paths, labels=None, train=False, size=256):
             self.root, self.paths, self.labels, self.train = Path(root), list(paths), labels, train
-            # 画像の端に一部だけ写るPコンも「あり」なので、切り抜き系の拡張は使わない
-            self.tf = T.Compose([T.Resize((size, size)), T.ToTensor(), T.Normalize(MEAN, STD)])
-            self.color = T.ColorJitter(brightness=0.25, contrast=0.25, saturation=0.1)
 
         def __len__(self):
             return len(self.paths)
 
         def __getitem__(self, i):
-            img = Image.open(self.root / self.paths[i]).convert("RGB")
+                img = Image.open(self.root / self.paths[i]).convert("RGB")
             if self.train:
                 img = self.color(img)
             x = self.tf(img)
@@ -159,7 +155,6 @@ if torch is not None:
                 x = torch.rot90(x, random.randint(0, 3), (1, 2))
             return x if self.labels is None else (x, torch.tensor(float(self.labels[i])))
 
-    def build_model(name):
         tv = torchvision.models
         if name == "resnet18":
             m = tv.resnet18(weights=tv.ResNet18_Weights.DEFAULT)
@@ -191,22 +186,16 @@ if torch is not None:
             outs.append(torch.stack([torch.sigmoid(model(v).squeeze(1)) for v in views]).mean(0).float().cpu())
         return torch.cat(outs).numpy()
 
-    def run_cnn(name, args, paths, y, test_paths, splits, device, out_dir):
-        d = Path(out_dir) / name
         d.mkdir(parents=True, exist_ok=True)
-        dl_te = DataLoader(PconDataset(args.data_root, test_paths, None, size=args.size),
                            batch_size=args.batch_size * 2, shuffle=False, num_workers=args.workers,
                            pin_memory=device.type == "cuda")
         oof, te = np.zeros(len(y)), np.zeros(len(test_paths))
         use_amp = device.type == "cuda"
         for k, (tr, va) in enumerate(splits):
-            dl_tr = DataLoader(PconDataset(args.data_root, paths[tr], y[tr], train=True, size=args.size),
                                batch_size=args.batch_size, shuffle=True, num_workers=args.workers,
                                drop_last=True, pin_memory=use_amp)
-            dl_va = DataLoader(PconDataset(args.data_root, paths[va], y[va], size=args.size),
                                batch_size=args.batch_size * 2, shuffle=False, num_workers=args.workers,
                                pin_memory=use_amp)
-            model = build_model(name).to(device)
             pos, neg = y[tr].sum(), (1 - y[tr]).sum()
             pw = torch.tensor([min(float(np.sqrt(neg / max(pos, 1))), 10.0)], device=device)
             crit = nn.BCEWithLogitsLoss(pos_weight=pw)
@@ -229,7 +218,6 @@ if torch is not None:
                 sched.step()
                 p = predict(model, dl_va, device, tta=False)
                 ap = average_precision_score(y[va], p) if y[va].sum() > 0 else 0.0
-                print(f"  [{name}] fold {k + 1}/{len(splits)} epoch {ep + 1}/{args.epochs} "
                       f"loss {total / max(len(tr), 1):.4f} val AP {ap:.4f}", flush=True)
                 if ap > best_ap:  # 検証APが最良のエポックを採用
                     best_ap = ap
@@ -294,14 +282,12 @@ def main():
     print("device:", device if device is not None else "PyTorchなし (CNNモデルはスキップ)")
 
     results, feats = {}, None
-    for name in args.models:
         if not args.rerun and (r := load_result(args.result_dir, name)) is not None and len(r[1]) == len(y):
             print(f"\n--- {name}: 既存の結果を読み込み (再実行は --rerun) ---")
             results[name] = r
             continue
         print(f"\n--- {name}: 学習開始 ---")
         t0 = time.time()
-        if name in SK_MODELS:
             if feats is None:
                 print("  画像の特徴量を計算中...", flush=True)
                 feats = (np.stack([image_features(root, p) for p in paths]),
@@ -311,7 +297,6 @@ def main():
             if torch is None:
                 print(f"  [スキップ] {name} には PyTorch が必要です: pip install torch torchvision")
                 continue
-            oof, te = run_cnn(name, args, paths, y, test_paths, splits, device, args.result_dir)
         m = save_result(args.result_dir, name, paths, y, oof, test_paths, te,
                         summarize(y, oof, splits, time.time() - t0))
         results[name] = (m, oof, te)

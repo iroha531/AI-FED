@@ -1,0 +1,20 @@
+# データセット
+W/
+
+# 実験結果
+result/
+result_baseline/
+
+# 学習済みモデル
+*.pt
+*.pth
+*.ckpt
+
+# Pythonキャッシュ
+__pycache__/
+*.pyc
+
+# IDE設定
+.idea/
+.vscode/
+
